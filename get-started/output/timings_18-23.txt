@@ -1,0 +1,13 @@
+Timing summary (seconds)
+load_entities: 0.006319
+string_feature_engineering: 0.003570
+embedding_generation: 133.527515
+linker_init: 0.095641
+estimate_probability_two_random_records_match: 0.189640
+estimate_u_using_random_sampling: 0.808612
+em_training: 0.536378
+inference_predict: 0.281980
+pairwise_as_dataframe: 0.026092
+clustering: 0.152969
+clusters_as_dataframe: 0.005267
+total_runtime: 135.790637
