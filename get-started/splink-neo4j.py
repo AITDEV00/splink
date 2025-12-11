@@ -63,12 +63,19 @@ timings: Dict[str, float] = {}
 
 
 # -------------------------------------------------------------------
-# 1. Load your entities
+# 1. Load entities and Filter
 # -------------------------------------------------------------------
 logger.info("Loading input_data.json")
 
 t_load0 = time.perf_counter()
 df = pd.read_json("input_data_large.json")
+
+# FILTER STEP: Discard 'data' types immediately
+initial_count = len(df)
+df = df[df['entity_type'] != 'data'].copy()
+filtered_count = len(df)
+logger.info(f"Filtered out {initial_count - filtered_count} records with entity_type='data'")
+
 df = df.reset_index(drop=True)
 df["unique_id"] = df.index.astype("int64")
 t_load1 = time.perf_counter()
@@ -77,10 +84,36 @@ logger.info("Loaded entities in %.3f seconds", timings["load_entities"])
 
 
 # -------------------------------------------------------------------
-# 2. String feature engineering
+# 2. String feature engineering (Hybrid Acronym)
 # -------------------------------------------------------------------
+def generate_hybrid_acronym(text: Any) -> str:
+    """
+    Generates an acronym based on Capitals OR Start of Words.
+    Example: "Abu Dhabi" -> "AD"
+    Example: "Ministry of Finance" -> "MOF"
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    
+    # Clean special chars, replace with space to preserve word boundaries
+    clean_text = re.sub(r'[^\w\s]', ' ', text)
+    acronym = []
+    is_start_of_word = True
+    
+    for char in clean_text:
+        if char.isspace():
+            is_start_of_word = True
+            continue
+        # Rule: Include if Capital OR Start of Word
+        if char.isupper() or is_start_of_word:
+            acronym.append(char.upper())
+        is_start_of_word = False
+        
+    return "".join(acronym).lower() # FIXED: Return lowercase to match normalization
+
+# Standard normalization for baseline comparison if needed, 
+# though main logic uses the acronym column now.
 def normalise_text(value: Any) -> str:
-    """Lowercase, remove accents, strip punctuation -> stable token string."""
     if not isinstance(value, str):
         return ""
     v = value.lower()
@@ -90,42 +123,12 @@ def normalise_text(value: Any) -> str:
     v = re.sub(r"\s+", " ", v).strip()
     return v
 
-def remove_spaces(value: str) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.replace(" ", "")
-
-def sort_tokens_alpha(value: str) -> str:
-    if not isinstance(value, str):
-        return ""
-    tokens = value.split()
-    tokens.sort()
-    return " ".join(tokens)
-
-# UPDATED: Handle single tokens correctly for strict acronym matching
-def initials_abbrev(value: str) -> str:
-    """
-    If single token (e.g. 'UAE'), return as is ('uae').
-    If multi token (e.g. 'United Arab Emirates'), return first chars ('uae').
-    """
-    if not isinstance(value, str):
-        return ""
-    tokens = value.split()
-    if not tokens:
-        return ""
-    # If it's already a single word/acronym, treat the whole word as the 'initials'
-    # This allows us to compare norm == initials
-    if len(tokens) == 1:
-        return tokens[0].lower()
-    
-    return "".join(t[0].lower() for t in tokens)
-
 t_feat0 = time.perf_counter()
 
+# Generate the hybrid acronym
+df["acronym"] = df["entity_id"].apply(generate_hybrid_acronym)
+# Keep standard normalization for backup/display
 df["entity_id_norm"] = df["entity_id"].apply(normalise_text)
-df["entity_id_nospace"] = df["entity_id_norm"].apply(remove_spaces)
-df["entity_id_tokens_sorted"] = df["entity_id_norm"].apply(sort_tokens_alpha)
-df["entity_id_initials"] = df["entity_id_norm"].apply(initials_abbrev)
 
 t_feat1 = time.perf_counter()
 timings["string_feature_engineering"] = t_feat1 - t_feat0
@@ -195,91 +198,58 @@ logger.info("Embedding generation took %.3f seconds", timings["embedding_generat
 
 
 # -------------------------------------------------------------------
-# 4. Splink settings - CONSOLIDATED LOGIC
+# 4. Splink settings - NEW PLAN LOGIC
 # -------------------------------------------------------------------
 db_api = DuckDBAPI()
 
-# A separate, backup comparison just for embeddings (for cases like "ADGM" vs "Abu Dhabi Global Market")
-# This is kept strict to avoid false positives.
-embedding_only_comparison = cl.CustomComparison(
-    output_column_name="description_embedding",
-    comparison_description="Similarity on description embeddings only",
+# The specific comparison logic from the plan
+# Using list_cosine_similarity to match existing codebase syntax
+strategy_comparison = cl.CustomComparison(
+    output_column_name="entity_id",
+    comparison_description="Hybrid Strategy: Safe Long-Form vs Verified Acronyms",
     comparison_levels=[
-        cll.NullLevel("description_embedding"),
-        cll.CustomLevel(
-            "list_cosine_similarity(description_embedding_l, description_embedding_r) >= 0.92",
-            label_for_charts="Very High Embedding Similarity"
-        ),
-        cll.ElseLevel(),
-    ],
-)
-
-# THE MASTER COMPARISON
-# This replaces ALL separate name/initials comparisons.
-# It enforces the "Acronym Trap" by structure: if both are acronyms and fail Level 1, 
-# they fall to 'Else' (Negative Weight) and never get a chance to be matched by fuzzy rules in Level 2 or 3.
-master_identifier_comparison = cl.CustomComparison(
-    output_column_name="master_identifier",
-    comparison_description="Consolidated Identifier Logic with Acronym Trap",
-    comparison_levels=[
-        cll.NullLevel("entity_id_norm"),
+        cll.NullLevel("entity_id"),
         
-        # LEVEL 1: STRICT ACRONYM MATCH
-        # Condition: Both are acronyms. 
-        # Requirement: EXACT match + High Embedding.
+        # Condition A: Safe Long-Form Match (Level 1)
+        # Logic: Both IDs must be significantly different from their acronyms (implying they are long forms)
+        # AND they must fuzzy match each other.
+        # FIXED: Added lower() calls to ensure case-insensitive matching in SQL
+        # FIXED: Added length > 4 check to force short codes to Condition B
+        # FIXED: Tightened fuzzy threshold to 0.96
         cll.CustomLevel(
-            """
-            (entity_id_norm_l = entity_id_initials_l AND entity_id_norm_r = entity_id_initials_r)
-            AND entity_id_initials_l = entity_id_initials_r
-            AND list_cosine_similarity(description_embedding_l, description_embedding_r) >= 0.85
+            sql_condition="""
+                (length(entity_id_norm_l) > 4) AND
+                (length(entity_id_norm_r) > 4) AND
+                (jaro_winkler_similarity(entity_id_norm_l, lower(acronym_l)) < 0.85) AND 
+                (jaro_winkler_similarity(entity_id_norm_r, lower(acronym_r)) < 0.85) AND 
+                (jaro_winkler_similarity(entity_id_norm_l, entity_id_norm_r) > 0.96)
             """,
-            label_for_charts="Strict Acronym Match (Exact + High Emb)"
+            label_for_charts="Condition A: Safe Long-Form Match"
         ),
 
-        # LEVEL 2: STANDARD FUZZY NAME MATCH
-        # GATED: Only runs if NOT both are acronyms.
+        # Condition B: Abbreviation/Acronym Match + Semantic Verification (Level 2)
+        # Logic: Acronyms match fuzzily AND Embeddings match strictly.
+        # This catches "AD" vs "Abu Dhabi" (where acronyms match) or "AD" vs "AD".
         cll.CustomLevel(
-            """
-            NOT (entity_id_norm_l = entity_id_initials_l AND entity_id_norm_r = entity_id_initials_r)
-            AND (
-                jaro_winkler_similarity(entity_id_norm_l, entity_id_norm_r) > 0.97
-                OR jaro_winkler_similarity(entity_id_nospace_l, entity_id_nospace_r) > 0.97
-                OR jaro_winkler_similarity(entity_id_tokens_sorted_l, entity_id_tokens_sorted_r) > 0.97
-            )
-            AND list_cosine_similarity(description_embedding_l, description_embedding_r) >= 0.80
+            sql_condition="""
+                (jaro_winkler_similarity(lower(acronym_l), lower(acronym_r)) > 0.85) AND 
+                (list_cosine_similarity(description_embedding_l, description_embedding_r) > 0.92)
             """,
-            label_for_charts="Standard Fuzzy Name Match (+ Emb)"
+            label_for_charts="Condition B: Verified Acronym Match"
         ),
 
-        # LEVEL 3: FUZZY INITIALS MATCH
-        # GATED: Only runs if NOT both are acronyms.
-        cll.CustomLevel(
-            """
-            NOT (entity_id_norm_l = entity_id_initials_l AND entity_id_norm_r = entity_id_initials_r)
-            AND jaro_winkler_similarity(entity_id_initials_l, entity_id_initials_r) > 0.95
-            AND list_cosine_similarity(description_embedding_l, description_embedding_r) >= 0.85
-            """,
-            label_for_charts="Fuzzy Initials Match (+ Emb)"
-        ),
-        
-        # LEVEL 4: FALLTHROUGH (The Trap's Dungeon)
-        # Any pair where (Both are Acronyms AND Mismatch) falls here.
-        # Any pair where (Names don't match AND Initials don't match) falls here.
-        cll.ElseLevel()
+        cll.ElseLevel() # Level 3
     ]
 )
 
 settings = SettingsCreator(
     link_type="dedupe_only",
     comparisons=[
-        # 1. The Master Identifier Comparison (Consolidated)
-        master_identifier_comparison,
-        
-        # 2. Embedding Backup (Strict)
-        embedding_only_comparison,
+        strategy_comparison,
+        cl.ExactMatch("entity_type") # Explicit match on entity type
     ],
     blocking_rules_to_generate_predictions=[
-        block_on("entity_type"),
+        block_on("entity_type"), # Restriction Step: Block on entity_type
     ],
     retain_intermediate_calculation_columns=True,
     em_convergence=0.01,
@@ -295,41 +265,26 @@ t_linker1 = time.perf_counter()
 timings["linker_init"] = t_linker1 - t_linker0
 logger.info("Linker initialisation took %.3f seconds", timings["linker_init"])
 
-# ----------------------------------------------------------------
-# DETERMINISTIC RULES (Must match the levels in comparisons)
-# ----------------------------------------------------------------
+# Deterministic Rules for Training
+# We mirror the levels logic for Probability estimation
+# FIXED: Updated rules to use normalized columns, length checks, lower(), and new thresholds
 deterministic_rules = ["""
     l.entity_type = r.entity_type
     AND (
-        -- CASE A: BOTH ARE ACRONYMS
+        -- Condition A: Safe Long Form
         (
-            (l.entity_id_norm = l.entity_id_initials AND r.entity_id_norm = r.entity_id_initials)
-            AND l.entity_id_initials = r.entity_id_initials
-            AND list_cosine_similarity(l.description_embedding, r.description_embedding) >= 0.85
+            (length(l.entity_id_norm) > 4) AND
+            (length(r.entity_id_norm) > 4) AND
+            (jaro_winkler_similarity(l.entity_id_norm, lower(l.acronym)) < 0.85) AND 
+            (jaro_winkler_similarity(r.entity_id_norm, lower(r.acronym)) < 0.85) AND 
+            (jaro_winkler_similarity(l.entity_id_norm, r.entity_id_norm) > 0.96)
         )
         OR
-        -- CASE B: AT LEAST ONE IS NOT AN ACRONYM
+        -- Condition B: Verified Acronym
         (
-            NOT (l.entity_id_norm = l.entity_id_initials AND r.entity_id_norm = r.entity_id_initials)
-            AND (
-                -- Strong Name Match
-                (
-                    (jaro_winkler_similarity(l.entity_id_norm, r.entity_id_norm) > 0.97
-                     OR jaro_winkler_similarity(l.entity_id_nospace, r.entity_id_nospace) > 0.97
-                     OR jaro_winkler_similarity(l.entity_id_tokens_sorted, r.entity_id_tokens_sorted) > 0.97)
-                    AND list_cosine_similarity(l.description_embedding, r.description_embedding) >= 0.80
-                )
-                OR
-                -- Fuzzy Initials Match
-                (
-                    jaro_winkler_similarity(l.entity_id_initials, r.entity_id_initials) > 0.95
-                    AND list_cosine_similarity(l.description_embedding, r.description_embedding) >= 0.85
-                )
-            )
+            (jaro_winkler_similarity(lower(l.acronym), lower(r.acronym)) > 0.85) AND 
+            (list_cosine_similarity(l.description_embedding, r.description_embedding) > 0.92)
         )
-        OR
-        -- CASE C: EMBEDDING ONLY (Backup)
-        list_cosine_similarity(l.description_embedding, r.description_embedding) >= 0.92
     )
 """]
 
@@ -384,23 +339,50 @@ preds = pairwise_predictions.as_pandas_dataframe()
 t_df1 = time.perf_counter()
 timings["pairwise_as_dataframe"] = t_df1 - t_df0
 
+# --- ADD REASON COLUMN ---
+def get_match_reason(gamma_val):
+    if gamma_val == 1:
+        return "Condition A: Safe Long-Form"
+    elif gamma_val == 2:
+        return "Condition B: Verified Acronym"
+    elif gamma_val == 3:
+        return "No Match (Else)"
+    return f"Level {gamma_val}"
+
+# Splink typically names the gamma column as 'gamma_{output_column_name}'
+if "gamma_entity_id" in preds.columns:
+    preds["match_reason"] = preds["gamma_entity_id"].apply(get_match_reason)
+else:
+    preds["match_reason"] = "Unknown (Gamma col missing)"
+
 # Columns to show for debugging
 cols = [
     "match_weight",
     "match_probability",
-    "bf_description_embedding", 
+    "match_reason", # Added the reason
 ]
-for col in ["entity_type_l", "entity_id_l", "entity_type_r", "entity_id_r"]:
+for col in ["entity_type_l", "entity_id_l", "acronym_l", "entity_id_r", "acronym_r"]:
     if col in preds.columns:
         cols.insert(0, col)
 
 if not preds.empty:
-    top10 = preds.sort_values("match_weight", ascending=False).head(10)[cols]
-    print("\n--- Top 10 Pairwise Predictions (markdown) ---")
-    top10_md = top10.to_markdown(index=False)
-    print(top10_md)
-    output_lines.append("\n## Top 10 pairwise predictions\n")
-    output_lines.append(top10_md)
+    # Filter for all matches > 0.5 probability
+    high_prob_preds = preds[preds["match_probability"] > 0.5].sort_values("match_weight", ascending=False)
+    
+    # We display up to 50 to avoid creating massive markdown files, 
+    # but the filter logic captures what you asked for.
+    display_limit = 50 
+    
+    print(f"\n--- High Probability Predictions (>0.5) [Top {display_limit} shown] ---")
+    
+    if len(high_prob_preds) > 0:
+        top_md = high_prob_preds.head(display_limit)[cols].to_markdown(index=False)
+        print(top_md)
+        output_lines.append(f"\n## High Probability Predictions (>0.5) [Top {display_limit} shown]\n")
+        output_lines.append(top_md)
+    else:
+        print("No predictions found with probability > 0.5")
+        output_lines.append("\n## No predictions found with probability > 0.5\n")
 else:
     output_lines.append("\n## No predictions found above threshold\n")
 
@@ -425,6 +407,30 @@ t_clusters_df1 = time.perf_counter()
 # 7. Build merge plan
 # -------------------------------------------------------------------
 t_merge0 = time.perf_counter()
+
+# --- NEW: Pre-calculate match reasons per cluster ---
+# 1. Map unique_id to cluster_id
+cluster_map = df_clusters.set_index("unique_id")["cluster_id"].to_dict()
+
+# 2. Add cluster IDs to predictions (only if preds not empty)
+if not preds.empty and "unique_id_l" in preds.columns and "unique_id_r" in preds.columns:
+    # We use map to attach the cluster ID to the left and right sides of the prediction
+    preds["cluster_id_l"] = preds["unique_id_l"].map(cluster_map)
+    preds["cluster_id_r"] = preds["unique_id_r"].map(cluster_map)
+    
+    # 3. Filter for edges that are WITHIN the same cluster
+    intra_cluster_preds = preds[preds["cluster_id_l"] == preds["cluster_id_r"]].copy()
+    
+    # 4. Group by cluster ID and collect unique match reasons
+    # Result: {101: "Condition A", 102: "Condition A | Condition B"}
+    reasons_by_cluster = (
+        intra_cluster_preds.groupby("cluster_id_l")["match_reason"]
+        .apply(lambda x: " | ".join(sorted(set(x))))
+        .to_dict()
+    )
+else:
+    reasons_by_cluster = {}
+
 merge_plans = []
 for cluster_id, g in df_clusters.groupby("cluster_id"):
     if len(g) == 1:
@@ -437,12 +443,17 @@ for cluster_id, g in df_clusters.groupby("cluster_id"):
         .iloc[0]
     )
 
+    # Fetch the pre-calculated reason for this cluster
+    reason_str = reasons_by_cluster.get(cluster_id, "Indirect Link / Unknown")
+
     merge_plans.append(
         {
             "cluster_id": int(cluster_id),
             "merged_entity_name": canonical,
+            "match_reasons": reason_str,  # Added to output
             "unique_ids": g["unique_id"].tolist(),
             "entity_ids": g["entity_id"].tolist(),
+            "acronyms": g["acronym"].tolist(),
             "entity_types": g["entity_type"].unique().tolist(),
         }
     )
