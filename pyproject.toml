@@ -21,6 +21,8 @@ dependencies = [
     "Jinja2>=3.0.3",
     "numpy>=1.17.3",
     "igraph>=0.11.2",
+    "fastembed>=0.4.2",
+    "onnxruntime>=1.19.2",
 ]
 
 [project.optional-dependencies]

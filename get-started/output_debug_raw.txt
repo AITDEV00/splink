@@ -1,2 +1,0 @@
-DEBUG: Cosine Similarity between 'ADIB Group' and 'Abu Dhabi Islamic Bank': 0.8666846448747725
---- Top 10 Pairwise Predictions ---

@@ -177,3 +177,6 @@ splink_db_log
 spark-warehouse
 
 scripts/pyspelling/dictionary.dic
+
+
+output/

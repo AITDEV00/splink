@@ -1,9 +1,0 @@
---- Top 10 Pairwise Predictions ---
-   match_weight  ...  bf_description_embedding
-2    -41.482171  ...                    0.0750
-0    -42.482171  ...                    0.0375
-1    -42.482171  ...                    0.0375
-
-[3 rows x 24 columns]
-Suggested merges:
-
