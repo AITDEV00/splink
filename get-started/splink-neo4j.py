@@ -72,9 +72,9 @@ df = pd.read_json("input_data_large.json")
 
 # FILTER STEP: Discard 'data' types immediately
 initial_count = len(df)
-df = df[df['entity_type'] != 'data'].copy()
+df = df[~df['entity_type'].isin(['data', 'year', 'date', 'period', 'timeperiod'])].copy()
 filtered_count = len(df)
-logger.info(f"Filtered out {initial_count - filtered_count} records with entity_type='data'")
+logger.info(f"Filtered out {initial_count - filtered_count} records with entity_type='data', 'year', 'date', 'period', 'timeperiod'")
 
 df = df.reset_index(drop=True)
 df["unique_id"] = df.index.astype("int64")
@@ -233,7 +233,7 @@ strategy_comparison = cl.CustomComparison(
         cll.CustomLevel(
             sql_condition="""
                 (jaro_winkler_similarity(lower(acronym_l), lower(acronym_r)) > 0.85) AND 
-                (list_cosine_similarity(description_embedding_l, description_embedding_r) > 0.92)
+                (list_cosine_similarity(description_embedding_l, description_embedding_r) > 0.96)
             """,
             label_for_charts="Condition B: Verified Acronym Match"
         ),
@@ -283,7 +283,7 @@ deterministic_rules = ["""
         -- Condition B: Verified Acronym
         (
             (jaro_winkler_similarity(lower(l.acronym), lower(r.acronym)) > 0.85) AND 
-            (list_cosine_similarity(l.description_embedding, r.description_embedding) > 0.92)
+            (list_cosine_similarity(l.description_embedding, r.description_embedding) > 0.96)
         )
     )
 """]
