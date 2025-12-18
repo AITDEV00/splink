@@ -367,7 +367,7 @@ for col in ["entity_type_l", "entity_id_l", "acronym_l", "entity_id_r", "acronym
 
 if not preds.empty:
     # Filter for all matches > 0.5 probability
-    high_prob_preds = preds[preds["match_probability"] > 0.5].sort_values("match_weight", ascending=False)
+    high_prob_preds = preds[preds["match_probability"] > 0.5].sort_values("match_weight", ascending=True)
     
     # We display up to 50 to avoid creating massive markdown files, 
     # but the filter logic captures what you asked for.
